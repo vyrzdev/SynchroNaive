@@ -1,9 +1,10 @@
 use std::cmp::{max, min};
+use std::error::Error;
 use hifitime::Epoch;
 use nodit::NoditMap;
 use crate::interval::{Interval, MERGE};
 use crate::observations::Observation;
-
+use crate::value::Value;
 
 pub struct History {
     history: NoditMap<Epoch, Interval, Level>
@@ -47,5 +48,18 @@ impl History {
             new_level.merge(level);
         }
         self.history.insert_strict(new_level.interval, new_level).unwrap() // Expect to succeed - Above remove_overlap guarantees it.
+    }
+
+    pub fn apply(&mut self, mut state: Value) -> Result<Option<Value>, Box<dyn Error>>{
+        for (_, L) in self.history.iter() {
+            if L.observations.len() == 1 {
+                state = L.observations[0].s1; // Expect access success.
+            } else {
+                // TODO: Handle Logic
+                todo!();
+                return Ok(None) // for now illegal
+            }
+        }
+        return Ok(Some(state));
     }
 }

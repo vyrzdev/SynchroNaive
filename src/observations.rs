@@ -1,15 +1,11 @@
 use uuid::Uuid;
 use crate::interval::Interval;
+use crate::value::Value;
+
 #[derive(Debug)]
 pub struct Observation {
     pub(crate) at: Interval,
-    action: Action,
+    s0: Value,
+    pub(crate) s1: Value,
     source: Uuid
-}
-
-pub type Value = String;
-#[derive(Debug)]
-pub enum Action {
-    Mutation(Value),
-    Assignment(Value)
 }

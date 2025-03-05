@@ -5,6 +5,7 @@ mod observations;
 mod interval;
 mod coordinator;
 mod history;
+mod value;
 
 fn main() {
     println!("Hello, world!");

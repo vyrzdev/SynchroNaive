@@ -7,13 +7,10 @@ pub fn coordinator(init: u32, receive: Receiver<Observation>) {
 
     loop {
         for observation in receive.try_iter() {
-            if let Some(obs) = observation {
-                history.add_new(obs);
-            } else {
-                break;
-            }
+            history.add_new(observation);
         }
 
         let new_value = history.apply(init);
+        println!("Calculated True Value: {:?}", new_value);
     }
 }
