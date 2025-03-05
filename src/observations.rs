@@ -5,7 +5,7 @@ use crate::value::Value;
 #[derive(Debug)]
 pub struct Observation {
     pub(crate) at: Interval,
-    s0: Value,
+    pub(crate) s0: Value,
     pub(crate) s1: Value,
-    source: Uuid
+    pub(crate) source: String
 }

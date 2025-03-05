@@ -2,12 +2,12 @@ use std::cmp::{max, min};
 use std::error::Error;
 use hifitime::Epoch;
 use nodit::NoditMap;
-use crate::interval::{Interval, MERGE};
+use crate::interval::{Interval, Moment, MERGE};
 use crate::observations::Observation;
 use crate::value::Value;
 
 pub struct History {
-    history: NoditMap<Epoch, Interval, Level>
+    history: NoditMap<Moment, Interval, Level>
 }
 
 #[derive(Debug)]
@@ -53,7 +53,7 @@ impl History {
     pub fn apply(&mut self, mut state: Value) -> Result<Option<Value>, Box<dyn Error>>{
         for (_, L) in self.history.iter() {
             if L.observations.len() == 1 {
-                state = L.observations[0].s1; // Expect access success.
+                state = L.observations[0].s1.clone(); // Expect access success.
             } else {
                 // TODO: Handle Logic
                 todo!();

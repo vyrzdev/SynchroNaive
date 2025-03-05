@@ -1,4 +1,4 @@
 
 
 // #[derive(Clone, Debug, PartialEq)]
-pub type Value = u32;
+pub type Value = String;
