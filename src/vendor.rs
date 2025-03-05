@@ -1,4 +1,5 @@
 use std::sync::mpsc;
+use crate::observations::Observation;
 
 pub type Config = String;
 
@@ -16,7 +17,7 @@ impl Observer {
         }
     }
 
-    pub fn poll_worker(&self, sync: mpsc::Sender<()>) {
+    pub fn poll_worker(&self, sync: mpsc::Sender<Observation>) {
 
     }
 }

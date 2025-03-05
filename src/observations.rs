@@ -1,6 +1,6 @@
 use uuid::Uuid;
 use crate::interval::Interval;
-
+#[derive(Debug)]
 pub struct Observation {
     pub(crate) at: Interval,
     action: Action,
@@ -8,15 +8,8 @@ pub struct Observation {
 }
 
 pub type Value = String;
+#[derive(Debug)]
 pub enum Action {
     Mutation(Value),
     Assignment(Value)
-}
-
-impl poset::PartialOrderBehaviour for Observation {
-    type Element = Observation;
-
-    fn ge(&self, a: &Self::Element, b: &Self::Element) -> bool {
-        a.at > b.at
-    }
 }
