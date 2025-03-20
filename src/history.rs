@@ -1,9 +1,7 @@
-use std::cmp::{max, min};
 use std::error::Error;
-use hifitime::Epoch;
 use nodit::NoditMap;
 use crate::interval::{Interval, Moment, MERGE};
-use crate::observations::Observation;
+use crate::observations::{Observation, DefinitionPredicate};
 use crate::value::Value;
 
 pub struct History {
@@ -20,19 +18,64 @@ pub struct Level {
 impl Level {
     fn new(first: Observation) -> Self {
         Level {
-            interval: first.at,
+            interval: first.interval,
             observations: Vec::from([first])
         }
     }
 
     fn add_new(&mut self, observation: Observation) {
-        self.interval = MERGE(self.interval, observation.at);
+        self.interval = MERGE(self.interval, observation.interval);
         self.observations.push(observation);
     }
 
     fn merge(&mut self, other: Level) {
-        self.observations.extend(other.observations);
-        self.interval = MERGE(self.interval, other.interval);
+        self.observations.extend(other.observations); // When levels merge merge observations
+        self.interval = MERGE(self.interval, other.interval); // AND grow interval
+    }
+
+    fn definition(&self) -> Option<DefinitionPredicate> {
+        let mut all_mut = true;
+        let mut cumulative_mut = 0;
+        let mut all_last_assn = true;
+        let mut value = None;
+
+        if self.observations.len() == 0 {
+            panic!("Should be Unreachable!")
+        }
+
+        if self.observations.len() == 1 {
+            return Some(self.observations[0].definition.clone()); // ref XXX
+        }
+
+        for observation in &self.observations {
+            match observation.definition {
+                DefinitionPredicate::Transition {..} => return None, // ref XXX
+                DefinitionPredicate::Assignment {v_new} => {
+                    all_mut = false;
+
+                    if let Some(v) = value {
+                        if v != v_new {
+                            return None // Distinct assignments cannot commute - ref XXX
+                        }
+                    } else {
+                        value = Some(v_new); // First assignment witnessed!
+                    }
+                },
+                DefinitionPredicate::Mutation {delta} => {
+                    all_last_assn = false;
+                    cumulative_mut += delta; // ref XXX
+                }
+            }
+        }
+
+        if all_mut {
+            return Some(DefinitionPredicate::Mutation {delta: cumulative_mut });
+        }
+        if all_last_assn {
+            return Some(DefinitionPredicate::Assignment {v_new: value.unwrap()});
+        }
+
+        return None; // Otherwise, no definition could be found!
     }
 }
 
@@ -42,24 +85,38 @@ impl History {
     }
 
     pub(crate) fn add_new(&mut self, observation: Observation) {
-        let interval = observation.at;
-        let mut new_level = Level::new(observation);
-        for (_, level) in self.history.remove_overlapping(interval) {
-            new_level.merge(level);
+        // Add new observation to history
+        let interval = observation.interval;
+        let mut new_level = Level::new(observation); // Instantiate new level set for observation.
+
+        for (_, level) in self.history.remove_overlapping(interval) { // any existing level-sets overlapping with new obs:
+            new_level.merge(level); // Merged into one new level set (they can no longer be ordered)
         }
         self.history.insert_strict(new_level.interval, new_level).unwrap() // Expect to succeed - Above remove_overlap guarantees it.
     }
 
-    pub fn apply(&mut self, mut state: Value) -> Result<Option<Value>, Box<dyn Error>>{
-        for (_, L) in self.history.iter() {
-            if L.observations.len() == 1 {
-                state = L.observations[0].s1.clone(); // Expect access success.
+    pub fn apply(&mut self, init: Value) -> Result<Option<Value>, Box<dyn Error>>{
+        let mut result = init;
+
+        for (_, L) in self.history.iter() { // Iterate over O in time order
+            if let Some(definition) = L.definition() { // If level defined for input:
+                match definition {
+                    DefinitionPredicate::Transition {v_0 , v_1} => if (result == v_0) {
+                        result = v_1; // ref XXX
+                    } else {
+                        return Ok(None); // Transitions are undefined for arbitrary inputs! ref XXX.
+                    },
+                    DefinitionPredicate::Assignment { v_new } => {
+                        result = v_new; // Regardless of input - assignment to v_new. ref XXX.
+                    },
+                    DefinitionPredicate::Mutation {delta} => {
+                        result = result + delta; // ref XXX
+                    }
+                }
             } else {
-                // TODO: Handle Logic
-                todo!();
-                return Ok(None) // for now illegal
+                return Ok(None) // If any undefined, conflict!
             }
         }
-        return Ok(Some(state));
+        Ok(Some(result))
     }
 }
