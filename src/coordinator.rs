@@ -1,3 +1,4 @@
+use log::{error, info};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::watch;
 use crate::history::History;
@@ -6,7 +7,7 @@ use crate::value::Value;
 
 const PROCESS_BUFFER_LIMIT: usize = 100;
 
-pub async fn coordinator(init: Value, mut receive: Receiver<Observation>, w_tx: watch::Sender<Option<Value>>) -> ! {
+pub async fn coordinator(init_consensus: Option<Value>, mut receive: Receiver<Observation>, w_tx: watch::Sender<Option<Value>>) -> ! {
     let mut history = History::new(); // Initialise empty O(V).
     let mut observations = Vec::with_capacity(PROCESS_BUFFER_LIMIT); // Input buffer to read observations.
 
@@ -17,14 +18,13 @@ pub async fn coordinator(init: Value, mut receive: Receiver<Observation>, w_tx: 
             history.add_new(observation); // For each observation, add it to O(V).
         }
 
+        let new_value = history.apply(init_consensus);
 
-
-
-
-
-        let new_value = history.apply(init.clone());
         if let Ok(v) = new_value {
+            info!("Coordinator - New Value: {:?}", new_value);
             w_tx.send(v).unwrap();
+        } else {
+            error!("Coordinator - Error: {:?}", new_value);
         }
     }
 }

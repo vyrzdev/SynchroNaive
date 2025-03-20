@@ -95,28 +95,32 @@ impl History {
         self.history.insert_strict(new_level.interval, new_level).unwrap() // Expect to succeed - Above remove_overlap guarantees it.
     }
 
-    pub fn apply(&mut self, init: Value) -> Result<Option<Value>, Box<dyn Error>>{
-        let mut result = init;
+    pub fn apply(&mut self, init: Option<Value>) -> Option<Value> {
+        let mut cumulative = init;
 
-        for (_, L) in self.history.iter() { // Iterate over O in time order
-            if let Some(definition) = L.definition() { // If level defined for input:
-                match definition {
-                    DefinitionPredicate::Transition {v_0 , v_1} => if (result == v_0) {
-                        result = v_1; // ref XXX
-                    } else {
-                        return Ok(None); // Transitions are undefined for arbitrary inputs! ref XXX.
-                    },
+        for (_, level) in self.history.iter() {
+            match level.definition() {
+                Some(definition) => match definition {
+                    DefinitionPredicate::Transition { v_0, v_1 } => {
+                        if cumulative.is_some() && cumulative == Some(v_0) {
+                            cumulative = Some(v_1);
+                        } else {
+                            cumulative = None;
+                        }
+                    }
+                    DefinitionPredicate::Mutation { delta } => {
+                        if let Some(v) = cumulative {
+                            cumulative = Some(v + delta);
+                        }
+                    }
                     DefinitionPredicate::Assignment { v_new } => {
-                        result = v_new; // Regardless of input - assignment to v_new. ref XXX.
-                    },
-                    DefinitionPredicate::Mutation {delta} => {
-                        result = result + delta; // ref XXX
+                        cumulative = Some(v_new);
                     }
                 }
-            } else {
-                return Ok(None) // If any undefined, conflict!
+                None => cumulative = None,
             }
         }
-        Ok(Some(result))
+
+        return cumulative;
     }
 }

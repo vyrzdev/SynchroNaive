@@ -3,6 +3,8 @@ use chrono::{Date, DateTime, TimeDelta, Utc};
 use hifitime::Duration;
 use nodit::{DiscreteFinite, InclusiveInterval};
 
+pub type Deviation = (TimeDelta, TimeDelta);
+
 #[derive(Debug, Clone, Copy, Ord, PartialOrd, Eq, PartialEq)]
 pub struct Moment(pub DateTime<Utc>);
 

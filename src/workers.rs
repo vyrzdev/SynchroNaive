@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
-use squareup::models::{BatchChangeInventoryRequest, BatchRetrieveInventoryChangesRequest, InventoryChange, InventoryPhysicalCount};
+use squareup::models::{BatchChangeInventoryRequest, BatchChangeInventoryResponse, BatchRetrieveInventoryChangesRequest, InventoryChange, InventoryPhysicalCount};
 use squareup::models::DateTime as SquareDateTime;
 use squareup::models::enums::{InventoryChangeType, InventoryState};
 use squareup::models::enums::InventoryState::InStock;
@@ -10,185 +10,252 @@ use tokio::sync::{watch};
 use tokio::sync::mpsc::{Sender};
 use tokio::time::sleep;
 use uuid::Uuid;
-use crate::interval::{Interval, Moment};
+use log::{debug, error, info};
+use squareup::models::errors::SquareApiError;
+use crate::interval::{Deviation, Interval, Moment};
 use crate::observations::{DefinitionPredicate, Observation};
-use crate::observer::Observer;
-use crate::value::Value;
+use crate::observer::SquareObserver;
+use crate::value::{Target, Value};
 
-pub async fn timestamped_record_worker(observer: &Observer, out_chan: Sender<Observation>, since: DateTime<Utc>) {
+const IGNORE: &'static str = "IGNORE";
 
+pub fn parse_change(
+    change: InventoryChange,
+    seen: &mut HashSet<String>,
+    deviation: &Deviation,
+    name: String
+) -> Option<Observation> {
+    match &change.r#type.as_ref().expect("No type in change!") {
+        InventoryChangeType::PhysicalCount => {
+            // Physical Count == Assignment
+
+            // Get Properties.
+            let physical_count = change.physical_count
+                .expect("Physical Count has no properties!");
+
+            // If tagged IGNORE - is from the writers - don't observe!
+            if let Some(v) = physical_count.reference_id  { if v.eq(IGNORE) { return None }}
+
+            // If seen before - don't observe!
+            let change_id= physical_count.id.expect("Physical Count has no ID!");
+            if seen.contains(&change_id) {
+                return None;
+            } else {
+                seen.insert(change_id); // If not seen, seen it now.
+            }
+
+            // Construct Observation.
+            let created_at: DateTime<Utc> = physical_count.created_at.expect("Physical Count had no created date!").into();
+            // TODO: Deviations.
+            let (min, max) = (created_at, created_at);
+            let new_value = Value::from_str(
+                &physical_count.quantity.expect("Physical Count had no quantity!")
+            ).expect("Unable to parse value from Physical Count!");
+
+            return Some(Observation {
+                definition: DefinitionPredicate::Assignment { v_new: new_value },
+                interval: Interval(Moment(min), Moment(max)),
+                source: name,
+            })
+        },
+        InventoryChangeType::Adjustment => {
+            // Adjustment == Mutation
+
+            // Get Properties.
+            let adjustment = change.adjustment
+                .expect("Adjustment has no properties!");
+
+            // If tagged IGNORE - is from the writers - don't observe!
+            if let Some(v) = adjustment.reference_id  { if v.eq(IGNORE) { return None }}
+
+            // If seen before - don't observe!
+            let change_id= adjustment.id.expect("Physical Count has no ID!");
+            if seen.contains(&change_id) {
+                return None;
+            } else {
+                seen.insert(change_id); // If not seen, seen it now.
+            }
+
+            // Construct Observation.
+            let created_at: DateTime<Utc> = adjustment.created_at.expect("Physical Count had no created date!").into();
+            // TODO: Deviations.
+            let (min, max) = (created_at, created_at);
+
+            // We consider only sales and additions - find delta:
+            let mut definition;
+            if matches!(adjustment.from_state.as_ref().expect("Adjustment had no FROM state!"), InStock) {
+                definition = DefinitionPredicate::Mutation {
+                    // Came FROM in-stock. Must be a decrement.
+                    delta: -(i64::from_str(
+                        &adjustment.quantity.expect("Adjustment had no quantity!")
+                    ).expect("Unable to parse value from Adjustment!"))
+                }
+            } else if  matches!(adjustment.to_state.as_ref().expect("Adjustment had no FROM state!"), InStock) {
+                definition = DefinitionPredicate::Mutation {
+                    // Went TO in-stock. Must be an increment.
+                    delta: (Value::from_str(
+                        &adjustment.quantity.expect("Adjustment had no quantity!")
+                    ).expect("Unable to parse value from Adjustment!"))
+                }
+            } else {
+                error!("Unrecognized FROM/TO state {:?} {:?}!", &adjustment.from_state, &adjustment.to_state);
+                return None;
+            }
+
+            // Construct Observation.
+            return Some(Observation {
+                definition,
+                interval: Interval(Moment(min), Moment(max)),
+                source: name,
+            })
+        },
+        _ => {
+            debug!("Ignoring Unknown Change Type: {change}");
+            return None;
+        }
+    }
+}
+
+pub async fn record_worker(
+    observer: &SquareObserver,
+    target: Target,
+    backoff: TimeDelta,
+    output: Sender<Observation>,
+) {
+    let mut since = SquareDateTime::now();
     let mut request = BatchRetrieveInventoryChangesRequest {
-        catalog_object_ids: Some(vec![observer.config.target.clone()]),
-        location_ids: Some(vec![observer.config.location_id.clone()]),
+        catalog_object_ids: Some(vec![target.1]),
+        location_ids: Some(vec![target.0]),
         types: None,
         states: None,
-        updated_after: Some(SquareDateTime::from(&since)),
+        updated_after: Some(since),
         updated_before: None,
         cursor: None,
         limit: None,
     };
 
+    // TODO: Clear Buffer When?
     let mut seen = HashSet::new();
 
     loop {
-        let new_since = SquareDateTime::from(&(Utc::now() - TimeDelta::seconds(5))) ;
-        let change_records_resp = observer.api.batch_retrieve_inventory_changes(
-            &request
+        let response = observer.inventory_api.batch_retrieve_inventory_changes(
+            &mut request,
         ).await;
-        request.updated_after = Some(new_since);
+        request.updated_after = Some(SquareDateTime::from(Utc::now() - backoff));
 
-        if let Ok(change_records) = change_records_resp {
-            if let Some(changes) = change_records.changes {
-                for change in changes {
-                    match change.r#type.expect("Change had no type!") {
-                        InventoryChangeType::PhysicalCount => {
-                            let physical_count = change.physical_count.expect("Physical Count has no properties!");
-                            if let Some(v) = physical_count.reference_id  {
-                                if v == "IGNORE" {
-                                    continue
-                                }
-                            }
-                            let change_id= physical_count.id.expect("Physical Count has no ID!");
-                            if seen.contains(&change_id) {
-                                continue;
-                            } else {
-                                seen.insert(change_id);
-                            }
-
-
-                            let created_at: DateTime<Utc> = physical_count.created_at.expect("Physical Count had no created date!").into();
-                            let (min, max) = (created_at + observer.deviation_min, created_at + observer.deviation_max);
-                            let definition = DefinitionPredicate::Assignment { v_new: i64::from_str(&physical_count.quantity.expect("Physical Count had no quantity!")).expect("Quantity was not integer!") };
-                            out_chan.send(
-                                Observation {
-                                    definition: definition,
-                                    interval: Interval(Moment(min), Moment(max)),
-                                    source: observer.uuid.clone(),
-                                }
-                            ).await.unwrap();
-                            println!("Physical Count Generated!");
-                        },
-                        InventoryChangeType::Adjustment => {
-                            let adjustment = change.adjustment.expect("Adjustment had no properties!");
-                            if let Some(v) = adjustment.reference_id  {
-                                if v == "IGNORE" {
-                                    continue
-                                }
-                            }
-                            let change_id= adjustment.id.expect("Physical Count has no ID!");
-                            if seen.contains(&change_id) {
-                                continue;
-                            } else {
-                                seen.insert(change_id);
-                            }
-
-                            let created_at: DateTime<Utc> = adjustment.created_at.expect("Adjustment had no created date!").into();
-                            let (min, max) = (created_at + observer.deviation_min, created_at + observer.deviation_max);
-
-                            let definition;
-                            if adjustment.from_state.expect("Adjustment had no from state!") == InStock {
-                                definition = DefinitionPredicate::Mutation { delta: -(i64::from_str(&adjustment.quantity.expect("Adjustment had no quantity!")).expect("Quantity was not integer!")) }
-                            } else if adjustment.to_state.expect("Adjustment had no to state!") == InStock {
-                                definition = DefinitionPredicate::Mutation { delta: (i64::from_str(&adjustment.quantity.expect("Adjustment had no quantity!")).expect("Quantity was not integer!")) }
-                            } else {
-                                println!("Unrecognized from/to state");
-                                continue;
-                            }
-
-
-                            out_chan.send(
-                                Observation {
-                                    definition: definition,
-                                    interval: Interval(Moment(min), Moment(max)),
-                                    source: observer.uuid.clone(),
-                                }
-                            ).await.unwrap();
-                            println!("Adjustment Generated!");
-                        },
-                        InventoryChangeType::Transfer => {
-                            eprintln!("Experienced Transfer - We do not consider these!");
-                        }
-                    }
+        if let Some(changes) = response.unwrap().changes {
+            for change in changes {
+                if let Some(obs) = parse_change(
+                    change,
+                    &mut seen,
+                    &(TimeDelta::new(0,0).expect("Foo"), TimeDelta::new(0,0).expect("Foo")), // TODO: Deviations.
+                    observer.name.clone()
+                ) {
+                    debug!("{observer.name} - New Observation: {:?}", obs);
+                    output.send(obs).await.unwrap();
                 }
-            } else {
-                println!("No changes!")
             }
-        } else {
-            eprintln!("Failed to request Records!");
-            println!("{:?}", change_records_resp);
-
         }
-        sleep(Duration::from_millis(2000)).await;
+        sleep(backoff.into()).await;
     }
 }
 
-pub enum PollingInterp {
+pub enum PollingInterpretation {
     Mutation,
     Assignment,
     Transition
 }
 
-pub async fn poll_worker(observer: &Observer, (mut last_state, mut last_at): (Value, Moment), sync: Sender<Observation>) {
-    loop {
-        let (state, at) = observer.request(&observer.config.target).await.unwrap();
+// (mut last_state, mut last_at): (Value, Moment)
+pub async fn poll_worker(
+    observer: &SquareObserver,
+    interpretation: PollingInterpretation,
+    target: Target,
+    backoff: TimeDelta,
+    name: String,
+    output: Sender<Observation>
+) {
+    let (mut last_state, mut last_sent) = (None, None);
 
-        if state != last_state {
-            sync.send(Observation {
-                definition: DefinitionPredicate::Transition {v_0: last_state, v_1: state}, // ref XXX.
-                interval: Interval(last_at, at.1), // ref XXX.
-                source: observer.uuid.clone(),
-            }).await.unwrap()
-        } else {
-            last_at = at.0;
+    loop {
+        let (state, sent, replied) = observer.request(&target.1).await.unwrap();
+
+        if last_state.is_some() && last_state != Some(state) {
+            output.send(Observation {
+                definition: match interpretation {
+                    PollingInterpretation::Mutation => {
+                        DefinitionPredicate::Mutation {delta: state - last_state.unwrap()}
+                    }
+                    PollingInterpretation::Assignment => {
+                        DefinitionPredicate::Assignment {v_new: state}
+                    }
+                    PollingInterpretation::Transition => {
+                        DefinitionPredicate::Transition {
+                            v_0: last_state.unwrap(), v_1: state
+                        }
+                    }
+                },
+                interval: Interval(Moment(last_sent.unwrap()), Moment(replied)),
+                source: name.clone(),
+            }).await.unwrap();
         }
+
+        last_state = Some(state);
+        last_sent = Some(sent);
+        sleep(backoff.into()).await;
     }
 }
 
-pub async fn platform_writer(observer: &Observer, mut next: watch::Receiver<Option<Value>>) {
-    loop {
-        next.changed().await.unwrap(); // Wait until a new value is available
-        let local_next = next.borrow().clone();
-        {
-            if let Some(v) = local_next {
-                let reference_key = "IGNORE".to_string();
-                let update_resp = observer.api.batch_change_inventory(
-                    &BatchChangeInventoryRequest {
-                        idempotency_key: Uuid::new_v4().to_string(),
-                        changes: Some(vec![
-                            InventoryChange {
-                                r#type: Some(InventoryChangeType::PhysicalCount),
-                                physical_count: Some(
-                                    InventoryPhysicalCount {
-                                        id: None,
-                                        reference_id: Some(reference_key.clone()),
-                                        catalog_object_id: Some(observer.config.target.clone()),
-                                        catalog_object_type: None,
-                                        state: Some(InventoryState::InStock),
-                                        location_id: Some(observer.config.location_id.clone()),
-                                        quantity: Some(v.to_string()),
-                                        source: None,
-                                        employee_id: None,
-                                        team_member_id: None,
-                                        occurred_at: Some(SquareDateTime::from(&Utc::now())),
-                                        created_at: None,
-                                    }
-                                ),
-                                adjustment: None,
-                                transfer: None,
-                                measurement_unit: None,
-                                measurement_unit_id: None,
-                            }
-                        ]),
-                        ignore_unchanged_counts: None,
-                    }
-                ).await;
-                if let Ok(resp) = update_resp {
-                    println!("Stock Updated!")
-                } else {
-                    eprintln!("Failed to update stock!");
-                    println!("{:?}", update_resp);
+pub async fn write(observer: &SquareObserver, target: Target, value: Value) -> Result<BatchChangeInventoryResponse, SquareApiError> {
+    observer.inventory_api.batch_change_inventory(
+        &BatchChangeInventoryRequest {
+            idempotency_key: Uuid::new_v4().to_string(),
+            changes: Some(vec![
+                InventoryChange {
+                    r#type: Some(InventoryChangeType::PhysicalCount),
+                    physical_count: Some(
+                        InventoryPhysicalCount {
+                            id: None,
+                            reference_id: Some(IGNORE.to_string()),
+                            catalog_object_id: Some(target.1),
+                            catalog_object_type: None,
+                            state: Some(InventoryState::InStock),
+                            location_id: Some(target.0),
+                            quantity: Some(value.to_string()),
+                            source: None,
+                            employee_id: None,
+                            team_member_id: None,
+                            occurred_at: Some(SquareDateTime::now()), // TODO: Preserve changes since some time?
+                            created_at: None,
+                        }
+                    ),
+                    adjustment: None,
+                    transfer: None,
+                    measurement_unit: None,
+                    measurement_unit_id: None,
                 }
+            ]),
+            ignore_unchanged_counts: None,
+        }
+    ).await
+}
+
+
+pub async fn write_worker(
+    observer: &SquareObserver,
+    target: Target,
+    mut next: watch::Receiver<Option<Value>>
+) {
+    loop {
+        next.changed().await.unwrap(); // Passes when new value available.
+        let local_next = next.borrow().clone(); // Take new value (save locally so can be changed while proc)
+
+        if let Some(v) = local_next {
+            if matches!(write(observer, target.clone(), v).await, Err(e)) {
+                error!("Writer {observer.name} - Failed to write to target! Reason: {e}");
             }
+        } else {
+            info!("Writer {observer.name} - Conflict! No Available Value");
         }
     }
 }

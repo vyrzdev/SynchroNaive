@@ -2,7 +2,7 @@ extern crate core;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     pub(crate) profiling_directory: String,
-    pub(crate) observers: Vec<(String, ObserverConfig)>
+    pub(crate) observers: Vec<(String, SquareObserverConfig)>
 }
 // use rand::distributions::{Distribution};
 use rand_distr::{Poisson, Distribution};
@@ -17,56 +17,135 @@ mod history;
 mod value;
 mod workers;
 mod testing;
-
-use std::{env, fs};
+use std::collections::HashMap;
+use std::fs::File;
+use std::path::Path;
 use std::sync::Arc;
 use chrono::{TimeDelta, Utc};
 use rand;
 use serde::{Deserialize, Serialize};
-use squareup::api::{CatalogApi, InventoryApi};
-use squareup::config::{BaseUri, Configuration, Environment};
-use squareup::http::client::HttpClientConfiguration;
-use squareup::SquareClient;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
-
 use crate::coordinator::coordinator;
-
-use crate::observer::{Observer, ObserverConfig};
-use crate::testing::generate_poll_series;
+use crate::observer::{SquareObserver, SquareObserverConfig};
 use crate::value::Value;
-use crate::workers::{platform_writer, timestamped_record_worker};
+use crate::workers::{poll_worker, record_worker, write_worker};
+use crate::workers::PollingInterpretation::Transition;
 
-const CHANNEL_BUFFER: usize = 100;
+async fn real_evaluation() {
+    // Load configuration.
+    let config = serde_json::from_reader(File::open(Path::new("config.json")).unwrap()).unwrap();
+
+    let mut observers = HashMap::new();
+    // Initialise Observers
+    for (uid, cfg) in config.observers {
+        observers.insert(uid, Arc::new(SquareObserver::new(uid, cfg)));
+    }
+
+    // TODO: Deviation Calculations.
+
+    let mut initial_value = None;
+    for obs in observers.values() {
+        let (value, _, _) = obs.request(obs.target.clone()).await.unwrap();
+        if initial_value.is_none() {
+            initial_value.replace(value); // If no replies yet - set!
+        } else if let Some(v) = initial_value {
+            if v != value {
+                initial_value = None;
+                break; // Stop iterating - initial value stays none.
+            }
+            // Otherwise - is same as others - still might be a shared init value!
+        }
+    }
+
+
+    // We will test polling with subset:
+    let polling_observers = vec!["Vendor A"];
+
+    // We will test timestamped records with subset:
+    let record_observers = vec!["Vendor B"];
+
+    // Initialise Coordinator Channels.
+    let (obs_tx, obs_rx) = mpsc::channel(1024);
+
+    // Initialise Polling Workers:
+    let mut polling_workers = JoinSet::new();
+    for name in polling_observers {
+        let observer = observers.get(name).unwrap();
+
+        // Clones for move.
+        let local_obs_tx = obs_tx.clone();
+
+        // Initialise Worker.
+        polling_workers.spawn(async move || poll_worker(
+            observer,
+            Transition,  // Interpret changes as Transitions.
+            observer.target.clone(),
+            TimeDelta::seconds(1),
+            name.to_string(),
+            local_obs_tx // Send observations here.
+        ));
+    }
+
+    // Initialise Record Workers:
+    let mut record_workers = JoinSet::new();
+    for name in record_observers {
+        let observer = observers.get(name).unwrap();
+
+        // Clone for move.
+        let local_obs_tx = obs_tx.clone();
+
+        // Initialise Worker.
+        record_workers.spawn(async move || record_worker(
+            observer,
+            observer.target.clone(),
+            TimeDelta::seconds(1),
+            local_obs_tx // Send observations here.
+        ));
+    }
+
+    // Initialise Writers:
+    let (consensus_tx, consensus_rx) = watch::channel(None);
+
+    let mut write_workers = JoinSet::new();
+    for observer in observers.values() {
+        // Clone for Move
+        let local_consensus_rx = consensus_rx.clone();
+
+        // Initialise Worker.
+        write_workers.spawn(async move || write_worker(
+            observer,
+            observer.target.clone(),
+            local_consensus_rx, // Receive new values here.
+        ));
+    }
+
+    // Initialise Coordinator
+    let coordinator_future = coordinator(initial_value, obs_rx, consensus_tx);
+
+    // Initialise Testing Workers
+    // TODO: Integrate testing workers.
+
+    // Run Threads!
+    futures::join!(observer_pool.join_all(), coordinator_fut);
+}
+
+
+
+
+
+
+
+
+
+// const CHANNEL_BUFFER: usize = 100;
 #[tokio::main]
 async fn main() {
-    generate_poll_series(0.0, 0.0, 20.0, 100, TimeDelta::seconds(1));
+    real_evaluation().await;
+
+
+
     panic!();
-
-    let config: Config = serde_json::from_slice(&fs::read("config.json").expect("Failed to read config.json!")).expect("Failed to parse config!");
-    let mut test_apis = Vec::new();
-    for (_, cfg) in config.observers.iter() {
-        env::set_var("SQUARE_API_TOKEN", &cfg.token);
-        let api = CatalogApi::new(SquareClient::try_new(Configuration {
-            environment: Environment::Sandbox, // OPTIONAL if you set the SQUARE_ENVIRONMENT env var
-            http_client_config: HttpClientConfiguration::default(),
-            base_uri: BaseUri::default(),
-        }).expect("Failed to create api"));
-        let test_api = InventoryApi::new(SquareClient::try_new(Configuration {
-            environment: Environment::Sandbox, // OPTIONAL if you set the SQUARE_ENVIRONMENT env var
-            http_client_config: HttpClientConfiguration::default(),
-            base_uri: BaseUri::default(),
-        }).expect("Failed to create api"));
-
-        test_apis.push((test_api, cfg.clone()));
-        // let response = api.list_catalog(&ListCatalogParameters {
-        //     cursor: None,
-        //     types: Some([ItemVariation].into()),
-        //     catalog_version: None,
-        // }).await;
-        // println!("{:?}", response);
-    }
-    let mut observers: Vec<Arc<Observer>> = config.observers.into_iter().map(|(uid, cfg)| Arc::new(Observer::new(uid, cfg).unwrap())).collect::<Vec<Arc<Observer>>>();
 
 
     // println!("Performing Deviation Calibration for each Observer:");
@@ -127,7 +206,7 @@ async fn main() {
 
     let coordinator_fut = coordinator(initial_value, rx, w_tx);
     let (x, y) = test_apis.pop().expect("Failed to get coordinator!");
-    futures::join!(observer_pool.join_all(), coordinator_fut);
+
 }
 
 
