@@ -1,20 +1,18 @@
 use std::sync::Arc;
 use chrono::{TimeDelta, TimeZone, Utc};
-use futures::StreamExt;
 use rand::prelude::Distribution;
 use rand::Rng;
-use rand_distr::{Exp, Poisson, Normal};
+use rand_distr::{Exp, Normal};
 use squareup::api::InventoryApi;
 use squareup::models::{BatchChangeInventoryRequest, DateTime, InventoryAdjustment, InventoryChange, InventoryPhysicalCount};
 use squareup::models::enums::{InventoryChangeType, InventoryState};
-use tokio::io::join;
 use tokio::task::JoinSet;
-use tokio::time::{interval, sleep};
+use tokio::time::sleep;
 use uuid::Uuid;
-use crate::observations::{DefinitionPredicate, Observation};
-use crate::observer::ObserverConfig;
+use crate::observations::DefinitionPredicate;
+use crate::observer::SquareObserverConfig;
 use crate::value::Value;
-use crate::workers::PollingInterp;
+use crate::workers::PollingInterpretation;
 // A seller who experiences avg X sales a day
 // experiences X/12 sales an hour (we assume none at midnight)
 // experiences X/16/60 sales every minute on average
@@ -63,7 +61,7 @@ async fn make_sale(api: Arc<InventoryApi>, location_id: String, target: String) 
 }
 
 async fn make_recount(api: Arc<InventoryApi>, location_id: String, target: String, value: String) {
-    let update_resp = api.batch_change_inventory(
+    api.batch_change_inventory(
         &BatchChangeInventoryRequest {
             idempotency_key: Uuid::new_v4().to_string(),
             changes: Some(vec![
@@ -93,15 +91,15 @@ async fn make_recount(api: Arc<InventoryApi>, location_id: String, target: Strin
             ]),
             ignore_unchanged_counts: None,
         }
-    ).await;
+    ).await.unwrap();
 }
 
-async fn external_users(api: InventoryApi, config: ObserverConfig, lambda: f64) {
+async fn external_users(api: InventoryApi, config: SquareObserverConfig, lambda: f64) {
     let api_ref = Arc::new(api);
 
     // Average Rate of Sales per minute = lambda
     // Therefore: Average time between sales is given by EXP 1/lambda
-    let mut exp = Exp::new(lambda).unwrap();
+    let exp = Exp::new(lambda).unwrap();
 
     let mut join_set = JoinSet::new();
     loop {
@@ -119,12 +117,12 @@ async fn external_users(api: InventoryApi, config: ObserverConfig, lambda: f64) 
     }
 }
 
-async fn manual_editor(api: InventoryApi, config: ObserverConfig, lambda: f64) {
+async fn manual_editor(api: InventoryApi, config: SquareObserverConfig, lambda: f64) {
     let api_ref = Arc::new(api);
 
     // Average rate of manual edits per minute = lambda
     // Therefore: Average time between edits is given by EXP 1/lambda
-    let mut exp = Exp::new(lambda).unwrap();
+    let exp = Exp::new(lambda).unwrap();
 
     let mut join_set = JoinSet::new();
     loop {
@@ -146,7 +144,7 @@ async fn manual_editor(api: InventoryApi, config: ObserverConfig, lambda: f64) {
 // TESTING IN SYNTHETIC ENVIRONMENT
 // EVALUATES: Correctness
 #[derive(Debug)]
-struct MockObservation {
+pub struct MockObservation {
     // true_interval: (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
     uncertainty_interval: (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
     true_actions: Vec<(DefinitionPredicate, chrono::DateTime<chrono::Utc>)>,
@@ -154,7 +152,7 @@ struct MockObservation {
     visible_at: chrono::DateTime<chrono::Utc>
 }
 
-pub fn generate_poll_series(sale_lambda: f64, count_lambda: f64, rtt_lambda: f64, poll_count: u64, initial_value: Value, backoff: chrono::TimeDelta, default_interp: PollingInterp) -> Vec<MockObservation> {
+pub fn generate_poll_series(sale_lambda: f64, count_lambda: f64, rtt_lambda: f64, poll_count: u64, initial_value: Value, backoff: chrono::TimeDelta, default_interp: PollingInterpretation) -> Vec<MockObservation> {
     // Sale/Edit lambda are given per-minute.
     // Polling backoff is timedelta
     // RTT is in milliseconds.
@@ -245,32 +243,34 @@ pub fn generate_poll_series(sale_lambda: f64, count_lambda: f64, rtt_lambda: f64
 
     // Generate observed definitions
     let mut cumulative = initial_value;
-    for result in &mut results {
+    let mut build = Vec::new();
+    for mut result in results {
         // Since all predicates in mocked are assn or mut - all are defined for arbitrary input
         let mut next = cumulative;
-        for (predicate, _) in result.1.true_actions {
+        for (predicate, _) in &result.1.true_actions {
             match predicate {
                 DefinitionPredicate::Transition { .. } => panic!(), // Should be impossible!
                 DefinitionPredicate::Mutation { delta } => {next = next + delta}
-                DefinitionPredicate::Assignment { v_new } => {next = v_new}
+                DefinitionPredicate::Assignment { v_new } => {next = *v_new }
             }
         }
 
         match default_interp {
-            PollingInterp::Mutation => {
+            PollingInterpretation::Mutation => {
                 result.1.observed_definition = Some(DefinitionPredicate::Mutation {delta: (next - cumulative)})
             }
-            PollingInterp::Assignment => {
+            PollingInterpretation::Assignment => {
                 result.1.observed_definition = Some(DefinitionPredicate::Assignment {v_new: next})
             }
-            PollingInterp::Transition => {
+            PollingInterpretation::Transition => {
                 result.1.observed_definition = Some(DefinitionPredicate::Transition {v_0: cumulative, v_1: next})
             }
         }
+        build.push(result.1);
         cumulative = next;
     };
 
-    return results.iter().map(|x| x.1).collect();
+    return build;
 }
 
 

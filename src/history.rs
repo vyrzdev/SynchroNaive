@@ -1,4 +1,3 @@
-use std::error::Error;
 use nodit::NoditMap;
 use crate::interval::{Interval, Moment, MERGE};
 use crate::observations::{Observation, DefinitionPredicate};
@@ -23,10 +22,10 @@ impl Level {
         }
     }
 
-    fn add_new(&mut self, observation: Observation) {
-        self.interval = MERGE(self.interval, observation.interval);
-        self.observations.push(observation);
-    }
+    // fn add_new(&mut self, observation: Observation) {
+    //     self.interval = MERGE(self.interval, observation.interval);
+    //     self.observations.push(observation);
+    // }
 
     fn merge(&mut self, other: Level) {
         self.observations.extend(other.observations); // When levels merge merge observations

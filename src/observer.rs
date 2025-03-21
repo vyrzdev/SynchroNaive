@@ -1,5 +1,4 @@
 use std::env;
-use std::error::Error;
 use std::str::FromStr;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -7,18 +6,11 @@ use squareup::api::{CatalogApi, InventoryApi};
 use squareup::config::{BaseUri, Configuration, Environment};
 use squareup::http::client::HttpClientConfiguration;
 use squareup::models::{RetrieveInventoryCountParams};
-use squareup::models::enums::{InventoryState};
 use squareup::models::enums::InventoryState::InStock;
 use squareup::models::errors::SquareApiError;
 use squareup::SquareClient;
-use crate::interval::{Interval, Moment};
 use crate::value::{Target, Value};
 
-const SQUARE_CONFIG: Configuration = Configuration {
-    environment: Environment::Sandbox, // Testing in Sandbox Environment
-    http_client_config: HttpClientConfiguration::default(),
-    base_uri: BaseUri::default(),
-};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SquareObserverConfig {
@@ -41,10 +33,18 @@ impl SquareObserver {
         env::set_var("SQUARE_API_TOKEN", config.token);
 
         // Initialise Catalog API
-        let catalog_api = CatalogApi::new(SquareClient::try_new(SQUARE_CONFIG).unwrap());
+        let catalog_api = CatalogApi::new(SquareClient::try_new( Configuration {
+            environment: Environment::Sandbox, // Testing in Sandbox Environment
+            http_client_config: HttpClientConfiguration::default(),
+            base_uri: BaseUri::default(),
+        }).unwrap());
 
         // Initialise Inventory API
-        let inventory_api = InventoryApi::new(SquareClient::try_new(SQUARE_CONFIG).unwrap());
+        let inventory_api = InventoryApi::new(SquareClient::try_new( Configuration {
+            environment: Environment::Sandbox, // Testing in Sandbox Environment
+            http_client_config: HttpClientConfiguration::default(),
+            base_uri: BaseUri::default(),
+        }).unwrap());
 
         return SquareObserver { name, catalog_api, inventory_api, target: (config.location_id, config.target)}
     }

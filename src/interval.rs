@@ -1,6 +1,5 @@
 use std::cmp::{max, min};
-use chrono::{Date, DateTime, TimeDelta, Utc};
-use hifitime::Duration;
+use chrono::{DateTime, TimeDelta, Utc};
 use nodit::{DiscreteFinite, InclusiveInterval};
 
 pub type Deviation = (TimeDelta, TimeDelta);

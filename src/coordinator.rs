@@ -1,4 +1,4 @@
-use log::{error, info};
+use log::info;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::watch;
 use crate::history::History;
@@ -20,11 +20,7 @@ pub async fn coordinator(init_consensus: Option<Value>, mut receive: Receiver<Ob
 
         let new_value = history.apply(init_consensus);
 
-        if let Ok(v) = new_value {
-            info!("Coordinator - New Value: {:?}", new_value);
-            w_tx.send(v).unwrap();
-        } else {
-            error!("Coordinator - Error: {:?}", new_value);
-        }
+        info!("Coordinator - New Value: {:?}", new_value);
+        w_tx.send(new_value).unwrap();
     }
 }

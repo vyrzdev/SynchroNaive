@@ -1,12 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::Arc;
 use chrono::{DateTime, TimeDelta, Utc};
 use squareup::models::{BatchChangeInventoryRequest, BatchChangeInventoryResponse, BatchRetrieveInventoryChangesRequest, InventoryChange, InventoryPhysicalCount};
 use squareup::models::DateTime as SquareDateTime;
 use squareup::models::enums::{InventoryChangeType, InventoryState};
 use squareup::models::enums::InventoryState::InStock;
-use tokio::sync::{watch};
+use tokio::sync::{watch, Mutex};
 use tokio::sync::mpsc::{Sender};
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -82,7 +82,7 @@ pub fn parse_change(
             let (min, max) = (created_at, created_at);
 
             // We consider only sales and additions - find delta:
-            let mut definition;
+            let definition;
             if matches!(adjustment.from_state.as_ref().expect("Adjustment had no FROM state!"), InStock) {
                 definition = DefinitionPredicate::Mutation {
                     // Came FROM in-stock. Must be a decrement.
@@ -110,19 +110,21 @@ pub fn parse_change(
             })
         },
         _ => {
-            debug!("Ignoring Unknown Change Type: {change}");
+            debug!("Ignoring Unknown Change Type: {:?}", change.r#type);
             return None;
         }
     }
 }
 
 pub async fn record_worker(
-    observer: &SquareObserver,
+    observer: Arc<SquareObserver>,
     target: Target,
     backoff: TimeDelta,
     output: Sender<Observation>,
-) {
-    let mut since = SquareDateTime::now();
+) -> ! {
+    info!("RECORD WORKER {} - hello world!", observer.name);
+    println!("HELLO!");
+    let since = SquareDateTime::now();
     let mut request = BatchRetrieveInventoryChangesRequest {
         catalog_object_ids: Some(vec![target.1]),
         location_ids: Some(vec![target.0]),
@@ -141,22 +143,23 @@ pub async fn record_worker(
         let response = observer.inventory_api.batch_retrieve_inventory_changes(
             &mut request,
         ).await;
-        request.updated_after = Some(SquareDateTime::from(Utc::now() - backoff));
+        request.updated_after = Some(SquareDateTime::from(&(Utc::now() - TimeDelta::seconds(5))));
 
         if let Some(changes) = response.unwrap().changes {
             for change in changes {
+                debug!("{:?}", change);
                 if let Some(obs) = parse_change(
                     change,
                     &mut seen,
                     &(TimeDelta::new(0,0).expect("Foo"), TimeDelta::new(0,0).expect("Foo")), // TODO: Deviations.
                     observer.name.clone()
                 ) {
-                    debug!("{observer.name} - New Observation: {:?}", obs);
+                    info!("{} - New Observation: {:?}",observer.name,  obs);
                     output.send(obs).await.unwrap();
                 }
             }
         }
-        sleep(backoff.into()).await;
+        sleep(backoff.to_std().unwrap()).await;
     }
 }
 
@@ -168,41 +171,45 @@ pub enum PollingInterpretation {
 
 // (mut last_state, mut last_at): (Value, Moment)
 pub async fn poll_worker(
-    observer: &SquareObserver,
+    observer: Arc<SquareObserver>,
     interpretation: PollingInterpretation,
     target: Target,
     backoff: TimeDelta,
     name: String,
+    mutex: Arc<Mutex<Option<Value>>>,
     output: Sender<Observation>
 ) {
-    let (mut last_state, mut last_sent) = (None, None);
+    let (mut last_state, mut last_sent) = (mutex, None);
 
     loop {
-        let (state, sent, replied) = observer.request(&target.1).await.unwrap();
+        {
+            let mut guard = last_state.lock().await;
 
-        if last_state.is_some() && last_state != Some(state) {
-            output.send(Observation {
-                definition: match interpretation {
-                    PollingInterpretation::Mutation => {
-                        DefinitionPredicate::Mutation {delta: state - last_state.unwrap()}
-                    }
-                    PollingInterpretation::Assignment => {
-                        DefinitionPredicate::Assignment {v_new: state}
-                    }
-                    PollingInterpretation::Transition => {
-                        DefinitionPredicate::Transition {
-                            v_0: last_state.unwrap(), v_1: state
+            let (state, sent, replied) = observer.request(target.clone()).await.unwrap();
+
+            if (*guard).is_some() && (*guard) != Some(state) {
+                output.send(Observation {
+                    definition: match interpretation {
+                        PollingInterpretation::Mutation => {
+                            DefinitionPredicate::Mutation {delta: state - (*guard).unwrap()}
                         }
-                    }
-                },
-                interval: Interval(Moment(last_sent.unwrap()), Moment(replied)),
-                source: name.clone(),
-            }).await.unwrap();
+                        PollingInterpretation::Assignment => {
+                            DefinitionPredicate::Assignment {v_new: state}
+                        }
+                        PollingInterpretation::Transition => {
+                            DefinitionPredicate::Transition {
+                                v_0: (*guard).unwrap(), v_1: state
+                            }
+                        }
+                    },
+                    interval: Interval(Moment(last_sent.unwrap()), Moment(replied)),
+                    source: name.clone(),
+                }).await.unwrap();
+            }
+            *guard = Some(state);
+            last_sent = Some(sent);
         }
-
-        last_state = Some(state);
-        last_sent = Some(sent);
-        sleep(backoff.into()).await;
+        sleep(backoff.to_std().unwrap()).await;
     }
 }
 
@@ -241,8 +248,8 @@ pub async fn write(observer: &SquareObserver, target: Target, value: Value) -> R
 }
 
 
-pub async fn write_worker(
-    observer: &SquareObserver,
+pub async fn record_write_worker(
+    observer: Arc<SquareObserver>,
     target: Target,
     mut next: watch::Receiver<Option<Value>>
 ) {
@@ -251,11 +258,35 @@ pub async fn write_worker(
         let local_next = next.borrow().clone(); // Take new value (save locally so can be changed while proc)
 
         if let Some(v) = local_next {
-            if matches!(write(observer, target.clone(), v).await, Err(e)) {
-                error!("Writer {observer.name} - Failed to write to target! Reason: {e}");
+            if matches!(write(&observer, target.clone(), v).await, Err(_)) {
+                error!("Writer {} - Failed to write to target!",observer.name);
             }
         } else {
-            info!("Writer {observer.name} - Conflict! No Available Value");
+            info!("Writer {} - Conflict! No Available Value", observer.name);
+        }
+    }
+}
+
+pub async fn polling_write_worker(
+    observer: Arc<SquareObserver>,
+    target: Target,
+    mutex: Arc<Mutex<Option<Value>>>,
+    mut next: watch::Receiver<Option<Value>>
+) {
+    loop {
+        next.changed().await.unwrap(); // Passes when new value available.
+        let local_next = next.borrow().clone(); // Take new value (save locally so can be changed while proc)
+        if let Some(v) = local_next {
+            // Wait for mutex over value
+            {
+                let mut lock = mutex.lock().await;
+                *lock = Some(v.clone()); // Last value is now new value.
+                if matches!(write(&observer, target.clone(), v).await, Err(_)) {
+                    error!("Writer {} - Failed to write to target!",observer.name);
+                }
+            }
+        } else {
+            info!("Writer {} - Conflict! No Available Value", observer.name);
         }
     }
 }

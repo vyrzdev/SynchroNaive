@@ -1,5 +1,4 @@
-use std::iter::Iterator;
- use crate::interval::Interval;
+use crate::interval::Interval;
 use crate::value::Value;
 
 #[derive(Debug, Clone, Copy)]
