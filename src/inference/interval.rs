@@ -1,11 +1,9 @@
 use std::cmp::{max, min};
-use chrono::{DateTime, TimeDelta, Utc};
 use nodit::{DiscreteFinite, InclusiveInterval};
-
-pub type Deviation = (TimeDelta, TimeDelta);
+use crate::observations::Tick;
 
 #[derive(Debug, Clone, Copy, Ord, PartialOrd, Eq, PartialEq)]
-pub struct Moment(pub DateTime<Utc>);
+pub struct Moment(Tick);
 
 #[derive(Debug, Copy, Clone)]
 pub struct Interval(pub Moment, pub Moment);
@@ -17,21 +15,21 @@ pub const GT: fn(Interval, Interval) -> bool = |a,b| (a.0 > b.1);
 pub const OVERLAP: fn(Interval, Interval) -> bool = |a, b| (!LT(a, b) && !GT(a, b));
 
 impl DiscreteFinite for Moment {
-    const MIN: Self = Moment(DateTime::<Utc>::MIN_UTC);
-    const MAX: Self = Moment(DateTime::<Utc>::MAX_UTC);
+    const MIN: Self = Moment(0);
+    const MAX: Self = Moment(u64::max_value());
 
     fn up(self) -> Option<Self>
     where
         Self: Sized
     {
-        Some(Moment(self.0 + TimeDelta::new(0, 1).expect("FAILED TO INIT TIME?")))
+        Some(Moment(self.0 + 1))
     }
 
     fn down(self) -> Option<Self>
     where
         Self: Sized
     {
-        Some(Moment(self.0 - TimeDelta::new(0, 1).expect("FAILED TO INIT TIME?")))
+        Some(Moment(self.0 - 1))
     }
 }
 impl From<nodit::Interval<Moment>> for Interval {

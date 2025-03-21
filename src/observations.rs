@@ -15,6 +15,16 @@ pub enum DefinitionPredicate {
     }
 }
 
+impl DefinitionPredicate {
+    pub(crate) fn apply(&self, input: &Value) -> Option<Value>{
+        match self {
+            DefinitionPredicate::Transition { v_0, v_1 } => if input == v_0 { Some(v_1.clone()) } else { None },
+            DefinitionPredicate::Mutation { delta } => {Some(input + delta)}
+            DefinitionPredicate::Assignment { v_new } => {Some(v_new.clone())}
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Observation {
     pub definition: DefinitionPredicate,
@@ -22,4 +32,10 @@ pub struct Observation {
     pub source: String
 }
 
+pub enum PollingInterpretation {
+    Transition,
+    Assignment,
+    Mutation
+}
 
+pub(crate) type Tick = u64;

@@ -1,5 +1,6 @@
+use log::{debug, info};
 use nodit::NoditMap;
-use crate::interval::{Interval, Moment, MERGE};
+use crate::inference::interval::{Interval, Moment, MERGE};
 use crate::observations::{Observation, DefinitionPredicate};
 use crate::value::Value;
 
@@ -98,6 +99,7 @@ impl History {
         let mut cumulative = init;
 
         for (_, level) in self.history.iter() {
+            info!("Processing Level: {:?}", level);
             match level.definition() {
                 Some(definition) => match definition {
                     DefinitionPredicate::Transition { v_0, v_1 } => {
