@@ -1,359 +1,376 @@
-use std::sync::Arc;
-use chrono::{TimeDelta, TimeZone, Utc};
-use rand::prelude::Distribution;
-use rand::Rng;
+use rand::prelude::{Distribution, ThreadRng};
 use rand_distr::{Exp, Normal};
-use squareup::api::InventoryApi;
-use squareup::models::{BatchChangeInventoryRequest, DateTime, InventoryAdjustment, InventoryChange, InventoryPhysicalCount};
-use squareup::models::enums::{InventoryChangeType, InventoryState};
-use tokio::task::JoinSet;
-use tokio::time::sleep;
-use uuid::Uuid;
+use rand_distr::num_traits::ToPrimitive;
+use crate::interval::Tick;
 use crate::observations::DefinitionPredicate;
-use crate::observer::SquareObserverConfig;
-use crate::value::Value;
-use crate::workers::PollingInterpretation;
+
+pub type Lambda = f64;
+pub type Event = (DefinitionPredicate, Tick);
+
+pub fn exp(lambda: Lambda, rng: &mut ThreadRng) -> Tick {
+    Exp::new(lambda).unwrap().sample(rng).to_u64().unwrap()
+}
+
+pub fn norm(lambda: Lambda, std_dev: Lambda, rng: &mut ThreadRng) -> Tick {
+    Normal::new(lambda, std_dev).unwrap().sample(rng).to_u64().unwrap()
+}
+
+
+
+
+
+
 // A seller who experiences avg X sales a day
 // experiences X/12 sales an hour (we assume none at midnight)
 // experiences X/16/60 sales every minute on average
 
 // TESTING IN PRACTICAL ENVIRONMENT
 // EVALUATES - CONFLICT RATE, AVERAGE TIME TO CONVERGE, ADHERENCE?
-
-async fn make_sale(api: Arc<InventoryApi>, location_id: String, target: String) {
-    let request = BatchChangeInventoryRequest {
-        idempotency_key: uuid::Uuid::new_v4().to_string(),
-        changes: Some(vec![
-            InventoryChange {
-                r#type: Some(InventoryChangeType::Adjustment),
-                physical_count: None,
-                adjustment: Some(InventoryAdjustment {
-                    id: None,
-                    reference_id: None,
-                    from_state: Some(InventoryState::InStock),
-                    to_state: Some(InventoryState::Sold),
-                    location_id: Some(location_id),
-                    catalog_object_id: Some(target.clone()),
-                    catalog_object_type: None,
-                    quantity: Some("1".to_string()),
-                    total_price_money: None,
-                    occurred_at: Some(DateTime::new()),
-                    created_at: None,
-                    source: None,
-                    employee_id: None,
-                    team_member_id: None,
-                    transaction_id: None,
-                    refund_id: None,
-                    purchase_order_id: None,
-                    goods_receipt_id: None,
-                    adjustment_group: None,
-                }),
-                transfer: None,
-                measurement_unit: None,
-                measurement_unit_id: None,
-            }
-        ]),
-        ignore_unchanged_counts: None,
-    };
-
-    api.batch_change_inventory(&request).await.unwrap();
-    println!("Made Sale!")
-}
-
-async fn make_recount(api: Arc<InventoryApi>, location_id: String, target: String, value: String) {
-    api.batch_change_inventory(
-        &BatchChangeInventoryRequest {
-            idempotency_key: Uuid::new_v4().to_string(),
-            changes: Some(vec![
-                InventoryChange {
-                    r#type: Some(InventoryChangeType::PhysicalCount),
-                    physical_count: Some(
-                        InventoryPhysicalCount {
-                            id: None,
-                            reference_id: None,
-                            catalog_object_id: Some(target),
-                            catalog_object_type: None,
-                            state: Some(InventoryState::InStock),
-                            location_id: Some(location_id),
-                            quantity: Some(value),
-                            source: None,
-                            employee_id: None,
-                            team_member_id: None,
-                            occurred_at: Some(DateTime::now()),
-                            created_at: None,
-                        }
-                    ),
-                    adjustment: None,
-                    transfer: None,
-                    measurement_unit: None,
-                    measurement_unit_id: None,
-                }
-            ]),
-            ignore_unchanged_counts: None,
-        }
-    ).await.unwrap();
-}
-
-async fn external_users(api: InventoryApi, config: SquareObserverConfig, lambda: f64) {
-    let api_ref = Arc::new(api);
-
-    // Average Rate of Sales per minute = lambda
-    // Therefore: Average time between sales is given by EXP 1/lambda
-    let exp = Exp::new(lambda).unwrap();
-
-    let mut join_set = JoinSet::new();
-    loop {
-        let wait = exp.sample(&mut rand::rng()) * (60000f64); // Get milliseconds wait (1/lambda * 60000)
-
-        join_set.spawn(make_sale(api_ref.clone(), config.location_id.clone(), config.target.clone()));
-
-        if wait < 0.01 {
-            continue // Don't send yet - add another one!
-        } else {
-            join_set.join_all().await; // Wait for them to send (and reply)
-            join_set = JoinSet::new(); // Wipe it clear.
-            sleep(core::time::Duration::from_millis(wait as u64)).await; // wait for given time.
-        }
-    }
-}
-
-async fn manual_editor(api: InventoryApi, config: SquareObserverConfig, lambda: f64) {
-    let api_ref = Arc::new(api);
-
-    // Average rate of manual edits per minute = lambda
-    // Therefore: Average time between edits is given by EXP 1/lambda
-    let exp = Exp::new(lambda).unwrap();
-
-    let mut join_set = JoinSet::new();
-    loop {
-        let wait = exp.sample(&mut rand::rng()) * (60000f64); // Get milliseconds wait (1/lambda * 60000)
-
-        join_set.spawn(make_recount(api_ref.clone(), config.location_id.clone(), config.target.clone(), "10".to_string()));
-
-        if wait < 0.01 {
-            continue // Don't send yet - add another one!
-        } else {
-            join_set.join_all().await; // Wait for them to send (and reply)
-            join_set = JoinSet::new(); // Wipe it clear.
-            sleep(core::time::Duration::from_secs(wait as u64)).await; // wait for given time.
-        }
-    }
-}
+//
+// async fn make_sale(observer: Arc<SquareObserver>, location_id: String, target: String) {
+//     let request = BatchChangeInventoryRequest {
+//         idempotency_key: uuid::Uuid::new_v4().to_string(),
+//         changes: Some(vec![
+//             InventoryChange {
+//                 r#type: Some(InventoryChangeType::Adjustment),
+//                 physical_count: None,
+//                 adjustment: Some(InventoryAdjustment {
+//                     id: None,
+//                     reference_id: None,
+//                     from_state: Some(InventoryState::InStock),
+//                     to_state: Some(InventoryState::Sold),
+//                     location_id: Some(location_id),
+//                     catalog_object_id: Some(target.clone()),
+//                     catalog_object_type: None,
+//                     quantity: Some("1".to_string()),
+//                     total_price_money: None,
+//                     occurred_at: Some(DateTime::new()),
+//                     created_at: None,
+//                     source: None,
+//                     employee_id: None,
+//                     team_member_id: None,
+//                     transaction_id: None,
+//                     refund_id: None,
+//                     purchase_order_id: None,
+//                     goods_receipt_id: None,
+//                     adjustment_group: None,
+//                 }),
+//                 transfer: None,
+//                 measurement_unit: None,
+//                 measurement_unit_id: None,
+//             }
+//         ]),
+//         ignore_unchanged_counts: None,
+//     };
+//
+//     observer.inventory_api.batch_change_inventory(&request).await.unwrap();
+//     println!("Made Sale!")
+// }
+//
+// async fn make_recount(observer: Arc<SquareObserver>, location_id: String, target: String, value: String) {
+//     observer.inventory_api.batch_change_inventory(
+//         &BatchChangeInventoryRequest {
+//             idempotency_key: Uuid::new_v4().to_string(),
+//             changes: Some(vec![
+//                 InventoryChange {
+//                     r#type: Some(InventoryChangeType::PhysicalCount),
+//                     physical_count: Some(
+//                         InventoryPhysicalCount {
+//                             id: None,
+//                             reference_id: None,
+//                             catalog_object_id: Some(target),
+//                             catalog_object_type: None,
+//                             state: Some(InventoryState::InStock),
+//                             location_id: Some(location_id),
+//                             quantity: Some(value),
+//                             source: None,
+//                             employee_id: None,
+//                             team_member_id: None,
+//                             occurred_at: Some(DateTime::now()),
+//                             created_at: None,
+//                         }
+//                     ),
+//                     adjustment: None,
+//                     transfer: None,
+//                     measurement_unit: None,
+//                     measurement_unit_id: None,
+//                 }
+//             ]),
+//             ignore_unchanged_counts: None,
+//         }
+//     ).await.unwrap();
+// }
+//
+// pub async fn external_users(observer: Arc<SquareObserver>, config: SquareObserverConfig, lambda: f64) {
+//     // Average Rate of Sales per minute = lambda
+//     // Therefore: Average time between sales is given by EXP 1/lambda
+//     let exp = Exp::new(lambda).unwrap();
+//
+//
+//     let first_wait = exp.sample(&mut rand::rng()) * (60000f64);
+//     sleep(core::time::Duration::from_millis(5000 + (first_wait as u64))).await;
+//     info!("Started Mocking External Users!");
+//
+//
+//     let mut join_set = JoinSet::new();
+//     loop {
+//         let wait = exp.sample(&mut rand::rng()) * (60000f64); // Get milliseconds wait (1/lambda * 60000)
+//
+//         join_set.spawn(make_sale(observer.clone(), config.location_id.clone(), config.target.clone()));
+//
+//         if wait < 0.01 {
+//             continue // Don't send yet - add another one!
+//         } else {
+//             join_set.join_all().await; // Wait for them to send (and reply)
+//             join_set = JoinSet::new(); // Wipe it clear.
+//             sleep(core::time::Duration::from_millis(wait as u64)).await; // wait for given time.
+//         }
+//     }
+// }
+//
+// pub async fn manual_editor(observer: Arc<SquareObserver>, config: SquareObserverConfig, lambda: f64) {
+//     // Average rate of manual edits per minute = lambda
+//     // Therefore: Average time between edits is given by EXP 1/lambda
+//     let exp = Exp::new(lambda).unwrap();
+//
+//     let first_wait = exp.sample(&mut rand::rng()) * (60000f64);
+//     sleep(core::time::Duration::from_millis(5000 + (first_wait as u64))).await;
+//     info!("Started Mocking Manual Editors!");
+//     let mut join_set = JoinSet::new();
+//     loop {
+//         let wait = exp.sample(&mut rand::rng()) * (60000f64); // Get milliseconds wait (1/lambda * 60000)
+//
+//         join_set.spawn(make_recount(observer.clone(), config.location_id.clone(), config.target.clone(), "10".to_string()));
+//
+//         if wait < 0.01 {
+//             continue // Don't send yet - add another one!
+//         } else {
+//             join_set.join_all().await; // Wait for them to send (and reply)
+//             join_set = JoinSet::new(); // Wipe it clear.
+//             sleep(core::time::Duration::from_millis(wait as u64)).await; // wait for given time.
+//         }
+//     }
+// }
 
 
 // TESTING IN SYNTHETIC ENVIRONMENT
 // EVALUATES: Correctness
-#[derive(Debug)]
-pub struct MockObservation {
-    // true_interval: (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
-    uncertainty_interval: (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
-    true_actions: Vec<(DefinitionPredicate, chrono::DateTime<chrono::Utc>)>,
-    observed_definition: Option<DefinitionPredicate>,
-    visible_at: chrono::DateTime<chrono::Utc>
-}
-
-pub fn generate_poll_series(sale_lambda: f64, count_lambda: f64, rtt_lambda: f64, poll_count: u64, initial_value: Value, backoff: chrono::TimeDelta, default_interp: PollingInterpretation) -> Vec<MockObservation> {
-    // Sale/Edit lambda are given per-minute.
-    // Polling backoff is timedelta
-    // RTT is in milliseconds.
-    // TODO: What scale should realtime be? Nanosecond or Millisecond?
-    // TODO: Seems that it should be higher than observable level.
-
-    // BUILDING POLL RESULTS:
-    // Assuming AVG time to platform, and AVG reply time is 1/2 avg RTT:
-    let ttp = Normal::new(0.5 * rtt_lambda, 1.0).unwrap();
-    let ttr = Normal::new(0.5 * rtt_lambda, 1.0).unwrap();
-
-    let mut results = Vec::with_capacity(poll_count as usize);
-
-    let mut real_time = chrono::DateTime::<Utc>::MIN_UTC; // From some time 0.
-    let mut last_poll_sent = chrono::DateTime::<Utc>::MIN_UTC;
-    let mut last_poll_processed_at = chrono::DateTime::<Utc>::MIN_UTC;
-    for poll in 0..poll_count {
-        let sent = real_time;
-        real_time += TimeDelta::milliseconds(ttp.sample(&mut rand::rng()) as i64); // Poll in Transit to Platform
-        let processed = real_time; // Poll processed by platform.
-        real_time += TimeDelta::milliseconds(ttr.sample(&mut rand::rng()) as i64); // Poll Reply in Transit
-        let replied = real_time;
-        real_time += backoff; // Add the Polling Backoff - Wait this time before next poll.
-
-        if poll != 0 {
-            // If has some previous poll...
-            // Changes may have occurred over the interval:
-            results.push(((last_poll_processed_at, processed),MockObservation {
-                // true_interval: (last_poll_processed_at, processed),
-                uncertainty_interval: (last_poll_sent, replied),
-                true_actions: vec![],
-                observed_definition: None,
-                visible_at: replied
-            }));
-        }
-        last_poll_sent = sent;
-        last_poll_processed_at = processed;
-    }
-
-    let final_real_time = real_time;
-    real_time = chrono::DateTime::<Utc>::MIN_UTC;
-
-    // Assuming Exponential Distribution for Sales
-    let tts = Exp::new(sale_lambda).unwrap();
-
-    // Generating Sales
-    while real_time < final_real_time {
-        let next_sale = TimeDelta::milliseconds(tts.sample(&mut rand::rng()) as i64);
-        real_time += next_sale;
-
-        if real_time < final_real_time {
-            for result in &mut results {
-                if real_time > result.0.0 && real_time < result.0.1 {
-                    result.1.true_actions.push((DefinitionPredicate::Mutation {
-                        delta: -1
-                    }, real_time));
-                }
-            }
-        }
-    }
-
-    real_time = chrono::DateTime::<Utc>::MIN_UTC;
-
-    // Assuming Exponential Distribution for Counts
-    let ttc = Exp::new(count_lambda).unwrap();
-
-    // Generating Counts
-    while real_time < final_real_time {
-        let next_sale = TimeDelta::milliseconds(ttc.sample(&mut rand::rng()) as i64);
-        real_time += next_sale;
-
-        if real_time < final_real_time {
-            for result in &mut results {
-                if real_time > result.0.0 && real_time < result.0.1 {
-                    result.1.true_actions.push((DefinitionPredicate::Assignment {
-                        v_new: 10 //TODO: Does the number matter?
-                    }, real_time));
-                }
-            }
-        }
-    }
-
-    // Sort all actions in true actions by time.
-    // TODO: Is precision enough to trust ordering?
-    for result in &mut results {
-        result.1.true_actions.sort_by_key(|x| x.1);
-    }
-
-    // Generate observed definitions
-    let mut cumulative = initial_value;
-    let mut build = Vec::new();
-    for mut result in results {
-        // Since all predicates in mocked are assn or mut - all are defined for arbitrary input
-        let mut next = cumulative;
-        for (predicate, _) in &result.1.true_actions {
-            match predicate {
-                DefinitionPredicate::Transition { .. } => panic!(), // Should be impossible!
-                DefinitionPredicate::Mutation { delta } => {next = next + delta}
-                DefinitionPredicate::Assignment { v_new } => {next = *v_new }
-            }
-        }
-
-        match default_interp {
-            PollingInterpretation::Mutation => {
-                result.1.observed_definition = Some(DefinitionPredicate::Mutation {delta: (next - cumulative)})
-            }
-            PollingInterpretation::Assignment => {
-                result.1.observed_definition = Some(DefinitionPredicate::Assignment {v_new: next})
-            }
-            PollingInterpretation::Transition => {
-                result.1.observed_definition = Some(DefinitionPredicate::Transition {v_0: cumulative, v_1: next})
-            }
-        }
-        build.push(result.1);
-        cumulative = next;
-    };
-
-    return build;
-}
-
-
-fn random_timestamp_within(start: chrono::DateTime<Utc>, end: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> {
-    let start_timestamp = start.timestamp(); // Seconds since Unix epoch
-    let end_timestamp = end.timestamp();
-
-    // Generate a random timestamp in the range
-    let random_timestamp = rand::rng().random_range(start_timestamp..=end_timestamp);
-
-    // Convert back to DateTime<Utc>
-    Utc.timestamp_opt(random_timestamp, 0).unwrap()
-}
-pub fn generate_record_series(sale_lambda: f64, count_lambda: f64, until: chrono::DateTime<chrono::Utc>, min_deviation: chrono::TimeDelta, max_deviation: chrono::TimeDelta, rtt_lambda: f64, backoff: chrono::TimeDelta) -> Vec<MockObservation> {
-    // realtime on the observer side.
-    let mut real_time = chrono::DateTime::<Utc>::MIN_UTC;
-    let mut events = Vec::new();
-
-    // Generate Sales
-    let tts = Exp::new(sale_lambda).unwrap();
-
-    while real_time < until {
-        let next_sale = TimeDelta::milliseconds(tts.sample(&mut rand::rng()) as i64);
-        real_time += next_sale;
-
-        events.push((real_time, DefinitionPredicate::Mutation {delta: -1}))
-    }
-
-    real_time = chrono::DateTime::<Utc>::MIN_UTC;
-    // Generate Counts
-    let ttc = Exp::new(count_lambda).unwrap();
-
-    while real_time < until {
-        let next_sale = TimeDelta::milliseconds(ttc.sample(&mut rand::rng()) as i64);
-        real_time += next_sale;
-
-        events.push((real_time, DefinitionPredicate::Assignment {v_new: 10})) // TODO: Does this number matter?
-    }
-
-    // Generate Polls (for records)
-    // Assuming AVG time to platform, and AVG reply time is 1/2 avg RTT:
-    let ttp = Normal::new(0.5 * rtt_lambda, 1.0).unwrap();
-    let ttr = Normal::new(0.5 * rtt_lambda, 1.0).unwrap();
-
-    let mut polls_at = Vec::new();
-    while real_time < until {
-        let sent = real_time;
-        real_time += TimeDelta::milliseconds(ttp.sample(&mut rand::rng()) as i64); // Poll in Transit to Platform
-        let processed = real_time; // Poll processed by platform.
-        real_time += TimeDelta::milliseconds(ttr.sample(&mut rand::rng()) as i64); // Poll Reply in Transit
-        let replied = real_time;
-        real_time += backoff; // Add the Polling Backoff - Wait this time before next poll.
-
-        polls_at.push((sent, processed, replied));
-    }
-
-    // Sort events by realtime occurrence
-    events.sort_by_key(|x| x.0);
-
-    let mut results = Vec::new();
-    let mut next_poll = 0;
-    // Okay now we model observations of these records.
-    // Each will have a timestamp - this timestamp will be 𝑝 = 𝑡 + 𝜎
-    // therefore, the timestamp will lie within [p_min, p_max] = [t+sigma_min, t+sigma_max]
-    // timestamp will be UTC - we don't need to care.
-    for (t, event) in events {
-        let timestamp = random_timestamp_within(t + min_deviation, t+max_deviation);
-
-        // TODO: Ignoring precision limitations.
-        // Observed uncertainty for event occurring at t in real time.
-        let uncertainty_interval = (timestamp + min_deviation, timestamp + max_deviation);
-
-        if t > polls_at[next_poll].1 { // If event occurred after next poll's processing time...
-            next_poll += 1; // Then this event is visible at next next poll.
-        } // Otherwise, this event is visible at next poll.
-
-        results.push(MockObservation {
-            uncertainty_interval,
-            true_actions: vec![(event, t)],
-            observed_definition: Some(event),
-            visible_at: polls_at[next_poll].2 // Only visible after poll reply.
-        })
-    }
-
-    return results;
-}
+// #[derive(Debug)]
+// pub struct MockObservation {
+//     // true_interval: (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
+//     pub(crate) uncertainty_interval: (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>),
+//     pub(crate) true_actions: Vec<(DefinitionPredicate, chrono::DateTime<chrono::Utc>)>,
+//     pub(crate) observed_definition: Option<DefinitionPredicate>,
+//     pub(crate) visible_at: chrono::DateTime<chrono::Utc>
+// }
+//
+// impl MockObservation {
+//     pub(crate) fn pretty_output(&self, from: &chrono::DateTime<Utc>) -> String {
+//         let label = match self.observed_definition.unwrap() {
+//             DefinitionPredicate::Transition { v_0, v_1 } => {format!("TR ({} -> {})", v_0, v_1)},
+//             DefinitionPredicate::Mutation { delta } => {format!("MU ({delta})")},
+//             DefinitionPredicate::Assignment { v_new } => {format!("AS ({v_new})")},
+//         };
+//
+//         format!(
+//             "{label} over {}, {} at {}",
+//             ((self.uncertainty_interval.0 - from).num_milliseconds() as f64)/1000.0,
+//             ((self.uncertainty_interval.1 - from).num_milliseconds() as f64)/1000.0,
+//             ((self.visible_at - from).num_milliseconds() as f64)/1000.0
+//         )
+//     }
+// }
+//
+// pub fn pretty_print_event_time_pair((event, at): &(DefinitionPredicate, chrono::DateTime<Utc>), from: &chrono::DateTime<Utc>) -> String {
+//     let label = match &event {
+//         DefinitionPredicate::Transition { .. } => {"TR"}
+//         DefinitionPredicate::Mutation { .. } => {"MU"}
+//         DefinitionPredicate::Assignment { .. } => {"AS"}
+//     };
+//     format!("| {label} @ {} |", ((*at - from).num_milliseconds() as f64)/1000.0)
+// }
+//
+//
+// pub fn generate_sales(sales_lambda: f64, from: chrono::DateTime<Utc>, until: chrono::DateTime<Utc>) -> Vec<(DefinitionPredicate, chrono::DateTime<Utc>)> {
+//     // Assuming Exponential Distribution for Sales
+//     // Sales occur at average rate of sales_lambda per-minute.
+//     // Exp(sales_lambda) -> time to next sale as a multiplier of minutes.
+//     let tts = Exp::new(sales_lambda).unwrap();
+//
+//
+//     let mut build = Vec::new(); // TODO: With Capacity?
+//     let mut real_time = from;
+//     while real_time < until {
+//         let next_sale_multiplier = tts.sample(&mut rand::rng());
+//         let next_sale_in = TimeDelta::milliseconds((next_sale_multiplier * 60000f64) as i64); // Next sale in X milliseconds.
+//         info!("Time: {}, Next In: {}", real_time, next_sale_in);
+//         real_time += next_sale_in;
+//
+//         if real_time < until {
+//             build.push((DefinitionPredicate::Mutation { delta: -1}, real_time.clone()));
+//         }
+//     }
+//     return build;
+// }
+// pub fn generate_edits(edit_lambda: f64, from: chrono::DateTime<Utc>, until: chrono::DateTime<Utc>, to: Value) -> Vec<(DefinitionPredicate, chrono::DateTime<Utc>)> {
+//     // Assuming Exponential Distribution for Edits
+//     // Edits occur at average rate of edit_lambda per-minute.
+//     // Exp(edit_lambda) -> time to next edit as a multiplier of minutes.
+//     let tte = Exp::new(edit_lambda).unwrap();
+//
+//
+//     let mut build = Vec::new(); // TODO: With Capacity?
+//     let mut real_time = from;
+//     while real_time < until {
+//         let next_edit_multiplier = tte.sample(&mut rand::rng());
+//         let next_edit_in = TimeDelta::milliseconds((next_edit_multiplier * 60000f64) as i64); // Next edit in X milliseconds.
+//         real_time += next_edit_in;
+//
+//         if real_time < until {
+//             build.push((DefinitionPredicate::Assignment { v_new: to.clone()}, real_time.clone()));
+//         }
+//     }
+//     return build;
+// }
+//
+// pub fn generate_polled_records(
+//     events: Vec<(DefinitionPredicate, chrono::DateTime<Utc>)>,
+//     from: chrono::DateTime<Utc>,
+//     backoff: TimeDelta,
+//     rtt_lambda: f64,
+//     deviation_lambda: f64,
+//     observed_min_deviation: chrono::TimeDelta,
+//     observed_max_deviation: chrono::TimeDelta,
+// ) -> Vec<MockObservation> {
+//     // Assume normal distribution for RTT.
+//     // Assuming AVG send/reply time is 1/2 RTT:
+//     let ttp = Normal::new(0.5 * rtt_lambda, 1.0).unwrap();
+//     let ttr = Normal::new(0.5 * rtt_lambda, 1.0).unwrap();
+//
+//     // Assume normal distribution for Deviation.
+//     let deviation = Normal::new(deviation_lambda, 0.0).unwrap(); // TODO: STD DEV
+//
+//     // Assuming events are time ordered.
+//     let last_event_at = events.last().unwrap().1;
+//
+//     let mut real_time = from;
+//     let mut next_event = 0;
+//     let mut results = Vec::new();
+//
+//     let mut poll_number = 0;
+//     let mut last_sent = from;
+//
+//     loop {
+//         if next_event == events.len() {
+//             break; // Last event included in last interval!
+//         }
+//         let sent = real_time;
+//         real_time += TimeDelta::milliseconds(ttp.sample(&mut rand::rng()) as i64); // In Transit to Platform.
+//         let processed = real_time;
+//         real_time += TimeDelta::milliseconds(ttr.sample(&mut rand::rng()) as i64); // In Transit to Observer.
+//         let replied = real_time;
+//
+//         let mut true_events = Vec::new();
+//         while &events[next_event].1 < &processed {
+//             true_events.push(events[next_event]);
+//             next_event += 1;
+//             if next_event == events.len() {
+//                 break; // Last event included in last interval!
+//             }
+//         }
+//
+//         for event in true_events {
+//             let reported_timestamp = event.1 + TimeDelta::milliseconds(deviation.sample(&mut rand::rng()) as i64);
+//
+//             results.push(MockObservation {
+//                 uncertainty_interval: ((reported_timestamp + observed_min_deviation), min((reported_timestamp+ observed_max_deviation), replied)),
+//                 true_actions: vec![(event.0, event.1)],
+//                 observed_definition: Some(event.0),
+//                 visible_at: replied,
+//             });
+//         }
+//
+//         real_time += backoff;
+//         poll_number += 1;
+//     }
+//     return results;
+// }
+// pub fn generate_polls(
+//     events: Vec<(DefinitionPredicate, chrono::DateTime<Utc>)>,
+//     from: chrono::DateTime<Utc>,
+//     initial_value: Value,
+//     backoff: TimeDelta,
+//     rtt_lambda: f64,
+//     interpretation: PollingInterpretation
+// ) -> Vec<MockObservation> {
+//     if events.is_empty() {
+//         return Vec::new();
+//     }
+//
+//     // Assume normal distribution for RTT.
+//     // Assuming AVG send/reply time is 1/2 RTT:
+//     let ttp = Normal::new(0.5 * rtt_lambda, 1.0).unwrap();
+//     let ttr = Normal::new(0.5 * rtt_lambda, 1.0).unwrap();
+//
+//     // Assuming events are time ordered.
+//     let last_event_at = events.last().unwrap().1;
+//
+//     let mut real_time = from;
+//     let mut value = initial_value;
+//     let mut next_event = 0;
+//     let mut results = Vec::new();
+//
+//     let mut poll_number = 0;
+//     let mut last_sent = from;
+//
+//     loop {
+//         if next_event == events.len() {
+//             break; // Last event included in last interval!
+//         }
+//         let sent = real_time;
+//         real_time += TimeDelta::milliseconds(ttp.sample(&mut rand::rng()) as i64); // In Transit to Platform.
+//         let processed = real_time;
+//         real_time += TimeDelta::milliseconds(ttr.sample(&mut rand::rng()) as i64); // In Transit to Observer.
+//         let replied = real_time;
+//
+//         let v_0 = value; // Value at the last poll.
+//         if poll_number > 0 {
+//             let mut true_events = Vec::new();
+//             while &events[next_event].1 < &processed {
+//                 value = events[next_event].0.apply(&value).unwrap(); // Since all are mut or assn - always defined.
+//                 true_events.push(events[next_event]);
+//                 next_event += 1;
+//                 if next_event == events.len() {
+//                     break; // Last event included in last interval!
+//                 }
+//             }
+//
+//             let v_1 = value; // Value at this poll.
+//
+//             if v_1 != v_0 {
+//                 results.push(MockObservation {
+//                     uncertainty_interval: (last_sent, replied),
+//                     true_actions: true_events,
+//                     observed_definition: match &interpretation {
+//                         PollingInterpretation::Mutation => {
+//                             Some(DefinitionPredicate::Mutation {delta: (v_1 - v_0)})
+//                         }
+//                         PollingInterpretation::Assignment => {
+//                             Some(DefinitionPredicate::Assignment {v_new: v_1})
+//                         }
+//                         PollingInterpretation::Transition => {
+//                             Some(DefinitionPredicate::Transition { v_0, v_1 })
+//                         }
+//                     },
+//                     visible_at: replied,
+//                 });
+//             }
+//         }
+//
+//         last_sent = sent;
+//         real_time += backoff;
+//         poll_number += 1;
+//     }
+//
+//     return results;
+// }
