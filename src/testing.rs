@@ -1,8 +1,7 @@
 use rand::prelude::{Distribution, ThreadRng};
 use rand_distr::{Exp, Normal};
 use rand_distr::num_traits::ToPrimitive;
-use crate::interval::Tick;
-use crate::observations::DefinitionPredicate;
+use crate::observations::{DefinitionPredicate, Tick};
 
 pub type Lambda = f64;
 pub type Event = (DefinitionPredicate, Tick);

@@ -6,9 +6,7 @@ extern crate core;
 // }
 
 mod observations;
-mod interval;
 mod coordinator;
-mod history;
 mod value;
 mod workers;
 mod testing;
@@ -26,10 +24,13 @@ use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinSet;
-use crate::interval::Tick;
-use crate::observations::{DefinitionPredicate, PollingInterpretation};
-use crate::observers::mocked::platform::{MockPlatform, MockPlatformConfig};
+use crate::inference::history::{NewHistory};
+use crate::observations::{DefinitionPredicate, PollingInterpretation, Tick};
+use crate::observers::mocked::mock_writer::{instant_write, InstantWriter};
+use crate::observers::mocked::poll_platform::{MockPlatform, MockPlatformConfig};
 use crate::observers::mocked::polling::MockPoller;
+use crate::observers::mocked::record::MockRecordPoller;
+use crate::observers::mocked::record_platform::{MockRecordPlatform, MockRecordPlatformConfig};
 // use crate::workers::{poll_worker, record_worker, polling_write_worker, record_write_worker, PollingInterpretation};
 // use crate::workers::PollingInterpretation::Transition;
 
@@ -219,34 +220,145 @@ use crate::observers::mocked::polling::MockPoller;
 fn simulate(until: Tick) {
     let mut time: Tick = 0; // Simulated RealTime.
 
-    let mut test_platform = MockPlatform::new(MockPlatformConfig {
-        name: "FooPlatform".to_string(),
+    let initial_value = 10000;
+
+    let mut test_polling_platform = MockPlatform::new(MockPlatformConfig {
+        name: "PollPlatform".to_string(),
         sale_lambda: 0.00003,
         edit_lambda: 0.0,
-        deviation_lambda: None,
-        deviation_std_dev: None,
-    }, 10);
+    }, 10000);
 
     let mut test_poller = MockPoller::new(
-        40,
+        40.0,
         1.0,
         1000,
-        PollingInterpretation::Transition
+        PollingInterpretation::Mutation
     );
 
+    // Test Writer
+    let mut test_poll_writer = InstantWriter::new();
+
+
+    let mut test_record_platform = MockRecordPlatform::new(MockRecordPlatformConfig {
+        name: "RecordPlatform".to_string(),
+        sale_lambda: 0.00003,
+        edit_lambda: 0.0,
+        deviation_lambda: 500.0,
+        deviation_std_dev: 0.2,
+        clock_precision: 1,
+    }, 10000);
+
+    let mut test_record_poller = MockRecordPoller::new(
+        40.0,
+        1.0,
+        1000,
+        1
+    );
+
+    // TODO: Record Pollers don't need writers - underlying value is irrelevant.
+    // We assume that a value gets written, and that we can identify and ignore actions originating from us.
+    // therefore - event stream is unchanged by writes, and thus derived value is unchanged.
+
+    let mut true_history = Vec::new();
+    let mut observed_history = NewHistory::new();
+
+
+
+    let mut consistent = true;
+    let mut conflict = false;
+    let mut time_to_convergence = 0;
+    let mut convergence_times = Vec::new();
+
+    let mut observed_value = Some(initial_value);
+    let mut true_value = initial_value;
+
     while time <= until {
-        if let Some(event) = test_platform.do_tick(&time) {
-            info!("Simulator - Event: {event:?} at {time}");
+        let mut new_event = false;
+        let mut new_observation = false;
+       if let Some(event) = test_polling_platform.do_tick(&time) {
+           // debug!("Simulator - Event: {event:?} at {time}");
+           true_history.push(event);
+           new_event = true;
+       }
+
+       if let Some(event) = test_record_platform.do_tick(&time) {
+           // debug!("Simulator - Event: {event:?} at {time}");
+           true_history.push(event);
+           new_event = true;
+       }
+
+       if let Some(obs) = test_poller.do_tick(&time, &test_polling_platform) {
+           // info!("Simulator - {obs:?} at {time}");
+           observed_history.add_new(obs);
+
+           new_observation = true;
+       }
+
+       if let Some(obs) = test_record_poller.do_tick(&time, &mut test_record_platform) {
+           // debug!("Simulator - {obs:?} at {time}");
+           for o in obs {
+               observed_history.add_new(o);
+           }
+           new_observation = true;
+       }
+
+        if new_event {
+            true_value = initial_value;
+            for (event, _) in &true_history {
+                true_value = event.apply(&true_value).unwrap();
+            }
         }
 
-        if let Some(obs) = test_poller.do_tick(&time, &test_platform) {
-            info!("Simulator - {obs:?} at {time}");
+        if new_observation {
+            observed_value = observed_history.apply(Some(initial_value));
+            // TODO: Writing Values :)
+            // We consider both Instantaneous (conflict free writes)
+            if let Some(new_value) = observed_value {
+                // info!("InstantWriter - Wrote: {new_value:?} at {time}");
+                test_poll_writer.do_write(new_value, &mut test_poller, &time);
+            }
+            // AND potentially lossy-writes (realistic, no mutex)
+
         }
+
+        // Do Writer Tick
+        test_poll_writer.do_tick(&mut test_polling_platform, &mut test_poller, &time);
+
+        if observed_value.is_none() {
+            info!("Simulator - Conflict, ending simulation.");
+            conflict = true;
+            break;
+        }
+
+        if observed_value.unwrap() != true_value {
+            consistent = false;
+        }
+
+        if !consistent {
+            if observed_value.unwrap() == true_value {
+                consistent = true;
+                convergence_times.push(time_to_convergence);
+                time_to_convergence = 0;
+            } else {
+                time_to_convergence += 1;
+            }
+        }
+
+        if time % (until/10) == 0 {
+            info!("10% MARK")
+        }
+
         time += 1;
-
-
-
     }
+    info!("Simulation Complete!");
+    info!("Convergence Times: {:?}", convergence_times);
+    info!("Average Time To Convergence: {}", convergence_times.iter().sum::<u64>() / convergence_times.len() as u64);
+    if conflict {
+        info!("Time to Conflict: {}", time);
+    } else {
+        info!("No Conflicts!")
+    }
+
 }
 
 
@@ -254,7 +366,7 @@ fn simulate(until: Tick) {
 async fn main() {
     colog::init();
     info!("MAIN - Starting Simulation");
-    simulate(60000);
+    simulate(600000);
     // fake_evaluation(
     //     Utc::now(),
     //     (Utc::now() + TimeDelta::seconds(60)),

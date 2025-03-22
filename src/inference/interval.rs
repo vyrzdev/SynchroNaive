@@ -3,7 +3,7 @@ use nodit::{DiscreteFinite, InclusiveInterval};
 use crate::observations::Tick;
 
 #[derive(Debug, Clone, Copy, Ord, PartialOrd, Eq, PartialEq)]
-pub struct Moment(Tick);
+pub struct Moment(pub Tick);
 
 #[derive(Debug, Copy, Clone)]
 pub struct Interval(pub Moment, pub Moment);
